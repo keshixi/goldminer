@@ -15,7 +15,8 @@ from sklearn import svm
 # 策略中必须有init方法
 def init(context):
     # 待轮动的行业指数(分别为：300工业.300材料.300可选.300消费.300医药.300金融)
-    context.industry_index = ['SHSE.000910', 'SHSE.000909', 'SHSE.000911', 'SHSE.000912', 'SHSE.000913', 'SHSE.000914']
+    # 300医药：SHSE.000913 农业：SHSE.000122 300地产：SHSE.000952 基建：SHSE.000950
+    context.industry_index = ['SHSE.000913', 'SHSE.000122', 'SHSE.000952', 'SHSE.000950']
     # 用于统计数据的天数
     context.stat_days = 5
 
@@ -23,7 +24,7 @@ def init(context):
     # 历史窗口长度
     context.svm_history_len = 10
     # 预测窗口长度
-    context.svm_forecast_len = 5
+    context.svm_forecast_len = 4
     # 训练样本长度
     context.svm_training_len = 90 #20天为一个交易月
 
@@ -34,12 +35,12 @@ def init(context):
     # 最小涨幅卖出幅度
     context.sell_rate = 0.02
     # 止损幅度
-    context.loss_rate = 0.04
+    context.loss_rate = 0.05
     # 最长持股天数
-    context.holding_days = 10
+    context.holding_days = 12
 
     # 预测任务
-    schedule(schedule_func=chooseIndustryStock, date_rule='1d', time_rule='09:30:00')
+    schedule(schedule_func=chooseIndustryStock, date_rule='1d', time_rule='14:45:00')
     # 订阅行情任务，用于执行建仓策略
     schedule(schedule_func=subFunc, date_rule='1d', time_rule='09:31:00')
 
@@ -73,9 +74,9 @@ def chooseIndustryStock(context):
     sector = return_index.index[np.argmax(return_index)]
     print('{}:最佳行业指数是:{}, 收益率:{}'.format(now, sector, return_index.loc[sector, 'return']))
 
-    if return_index.loc[sector, 'return'] < 0.005:
-        print("所选行业收益率太低，退出选股")
-        return
+    #if return_index.loc[sector, 'return'] < 0.005:
+    #    print("所选行业收益率太低，退出选股")
+    #    return
 
     # 获取最佳行业指数成份股
     symbols = get_history_constituents(index=sector, start_date=last_day, end_date=last_day)[0]['constituents'].keys()
@@ -86,17 +87,32 @@ def chooseIndustryStock(context):
     instrumentinfos = get_instrumentinfos(symbols=symbols, df=True)
     symbols = list(
         instrumentinfos[(instrumentinfos['listed_date'] < now) & (instrumentinfos['delisted_date'] > now)]['symbol'])
-    # 获取最佳行业指数成份股的市值，选取市值最大的N只股票
-    fin = get_fundamentals(table='trading_derivative_indicator', symbols=symbols, start_date=last_day,
-                           end_date=last_day, limit=context.holding_num, fields='TOTMKTCAP', order_by='-TOTMKTCAP',
-                           df=True)
+    # 获取最佳行业指数成份股的市值，选取10<市盈率<30, 5%<换手率<10% 的股票
+    #fin = get_fundamentals(table='trading_derivative_indicator', symbols=symbols, start_date=last_day,
+    #                       end_date=last_day, limit=context.holding_num, fields='TOTMKTCAP', order_by='-TOTMKTCAP',
+    #                       df=True)
+    fin = get_fundamentals(table='trading_derivative_indicator', symbols=symbols, start_date=now,
+                     end_date=now, limit=context.holding_num, fields='PETTM,TURNRATE', order_by='-PETTM,-TURNRATE',
+                     filter='PETTM<30 and PETTM>10 and TURNRATE>5 and TURNRATE<10', df=True)
+    if len(fin) == 0:
+        print("行业选股无法满足要求，退出选股！")
+        return
     context.to_predict = list(fin['symbol'])
-    print('获取市值最大的N只股票：{}'.format(context.to_predict))
+    print('获取符合要求的{}只股票：{}'.format(context.holding_num, context.to_predict))
 
     # 上一轮的交易日
     last_turn_date = get_previous_N_trading_date(last_day, counts=context.svm_training_len, exchanges='SHSE')
     # 遍历待预测股票，进行支持向量机预测
     for symbol in context.to_predict:
+        # 如果仓位已满，则退出；如果仓位中已存在，则跳过
+        positions = context.account().positions()
+        if len(positions) >= context.holding_num:
+            print("仓位已满，退出预测.")
+            break
+        pos = [p for p in positions if p.symbol == symbol]
+        if len(pos) > 0:
+            print("仓位中已存在该股票:{}".format(symbol))
+            continue
         features = clf_fit(context, symbol, last_turn_date, last_day)
         features = np.array(features).reshape(1, -1)
         prediction = context.clf.predict(features)[0]
@@ -105,10 +121,7 @@ def chooseIndustryStock(context):
             print("支持向量预测买入{}".format(symbol))
             order_target_percent(symbol=symbol, percent=0.33, order_type=OrderType_Market,
                                  position_side=PositionSide_Long)
-            positions = context.account().positions()
-            if len(positions) >= context.holding_num:
-                print("仓位已满，退出预测.")
-                break
+
 
 
 def get_previous_N_trading_date(date,counts=1,exchanges='SHSE'):
@@ -135,6 +148,15 @@ def clf_fit(context, symbol, start_date, end_date):
                           df=True).set_index('eob')
     x_train = []
     y_train = []
+    # 添加一行当天的数据
+    curr_data = history_n(symbol, frequency='tick', count=1, end_time=context.now, fill_missing='last', df=True)
+    if len(curr_data) > 0:
+        dict = {"close": curr_data.iloc[0]['price'],
+                      "high": curr_data.iloc[0]['high'],
+                      "low": curr_data.iloc[0]['low'],
+                      "volume": curr_data.iloc[0]['cum_volume']}
+        df = pd.DataFrame(dict, index=[0])
+        recent_data.append(df)
     # 整理训练数据
     for index in range(context.svm_history_len, len(recent_data)):
         # 自变量 X
@@ -207,7 +229,7 @@ def on_bar(context, bars):
         #    print("平仓:{}周三尾盘并且涨幅{}<{}%,平掉所有仓位止损".format(position.symbol, bar.close / position['vwap']-1, context.sell_rate*100))
         #    order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
         # 当持股天数超过10天,平掉所有仓位止损
-        elif position and (now - position.created_at).days >= context.holding_days and bar.close / position['vwap'] < 1 + context.sell_rate and now.hour == 14 and now.minute == 55:
+        elif position and (now - position.created_at).days >= context.holding_days and bar.close / position['vwap'] < 1 + context.sell_rate and now.hour == 14 and now.minute > 30:
             print("平仓:{}持股天数超过{}并且涨幅{}<{}%，平掉所有仓位止损".format(position.symbol,context.holding_days, bar.close / position['vwap']-1, context.sell_rate*100))
             order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
 
@@ -263,8 +285,8 @@ if __name__ == '__main__':
         filename='main.py',
         mode=MODE_BACKTEST,
         token='3bb4cf8eb647a46c132ee8c6093932b873fca7c0',
-        backtest_start_time='2021-10-01 08:00:00',
-        backtest_end_time='2021-12-30 16:00:00',
+        backtest_start_time='2022-01-01 08:00:00',
+        backtest_end_time='2022-05-08 16:00:00',
         backtest_adjust=ADJUST_PREV,
         backtest_initial_cash=10000000,
         backtest_commission_ratio=0.0001,
