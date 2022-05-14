@@ -3,15 +3,33 @@ from __future__ import print_function, absolute_import
 from gm.api import *
 import numpy as np
 import pandas as pd
-import datetime
+import datetime,time
+import logging
 
 from sklearn import svm
 
+def get_logger():
+    logger = logging.getLogger("industry_svc")
+    logger.setLevel(logging.INFO)
+
+    today = time.strftime('%Y%m%d', time.localtime(time.time()))
+    fileHandler = logging.FileHandler("d://cauchy/logs/industry_svc/isvc_"+ today +".log", mode='a')
+    fileHandler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(filename)s - line:%(lineno)d - [%(levelname)s] : %(message)s")
+    fileHandler.setFormatter(formatter)
+
+    consoleHandler = logging.StreamHandler()
+    fileHandler.setLevel(logging.DEBUG)
+    consoleHandler.setFormatter(formatter)
+
+    logger.addHandler(fileHandler)
+    logger.addHandler(consoleHandler)
+    return logger
+logger = get_logger()
 '''
 行业轮动 + 机器学习（支持向量机）结合策略
 逻辑：1.在行业指数标的中，选取历史收益最大一个行业指数，选取其中的N个绩优股
 '''
-
 # 策略中必须有init方法
 def init(context):
     # 待轮动的行业指数(分别为：300工业.300材料.300可选.300消费.300医药.300金融)
@@ -44,20 +62,25 @@ def init(context):
     # 订阅行情任务，用于执行建仓策略
     schedule(schedule_func=subFunc, date_rule='1d', time_rule='09:31:00')
 
+
+
 # 订阅行情方法
 def subFunc(context):
+    logger.info("subFuc start")
     positions = context.account().positions()
     symbols = ",".join([position['symbol'] for position in positions])
-    print("订阅行情，当前持有:{}".format(symbols))
+    logger.info("订阅行情，当前持有:{}".format(symbols))
     subscribe(symbols=symbols, frequency='60s', unsubscribe_previous=True)
+
 
     # 根据行业指数获取绩优股
 def chooseIndustryStock(context):
+    logger.info("chooseIndustryStock start")
     now = context.now
 
     positions = context.account().positions()
     if len(positions) >= context.holding_num:
-        print("仓位已满，直接退出.")
+        logger.info("仓位已满，直接退出.")
         return
 
     # 获取上一个交易日
@@ -72,7 +95,7 @@ def chooseIndustryStock(context):
 
     # 获取指定数内收益率表现最好的行业
     sector = return_index.index[np.argmax(return_index)]
-    print('{}:最佳行业指数是:{}, 收益率:{}'.format(now, sector, return_index.loc[sector, 'return']))
+    logger.info('{}:最佳行业指数是:{}, 收益率:{}'.format(now, sector, return_index.loc[sector, 'return']))
 
     #if return_index.loc[sector, 'return'] < 0.005:
     #    print("所选行业收益率太低，退出选股")
@@ -95,10 +118,10 @@ def chooseIndustryStock(context):
                      end_date=now, limit=context.holding_num, fields='PETTM,TURNRATE', order_by='-PETTM,-TURNRATE',
                      filter='PETTM<30 and PETTM>10 and TURNRATE>5 and TURNRATE<10', df=True)
     if len(fin) == 0:
-        print("行业选股无法满足要求，退出选股！")
+        logger.info("行业选股无法满足要求，退出选股！")
         return
     context.to_predict = list(fin['symbol'])
-    print('获取符合要求的{}只股票：{}'.format(context.holding_num, context.to_predict))
+    logger.info('获取符合要求的{}只股票：{}'.format(context.holding_num, context.to_predict))
 
     # 上一轮的交易日
     last_turn_date = get_previous_N_trading_date(last_day, counts=context.svm_training_len, exchanges='SHSE')
@@ -107,18 +130,18 @@ def chooseIndustryStock(context):
         # 如果仓位已满，则退出；如果仓位中已存在，则跳过
         positions = context.account().positions()
         if len(positions) >= context.holding_num:
-            print("仓位已满，退出预测.")
+            logger.info("仓位已满，退出预测.")
             break
         pos = [p for p in positions if p.symbol == symbol]
         if len(pos) > 0:
-            print("仓位中已存在该股票:{}".format(symbol))
+            logger.info("仓位中已存在该股票:{}".format(symbol))
             continue
         features = clf_fit(context, symbol, last_turn_date, last_day)
         features = np.array(features).reshape(1, -1)
         prediction = context.clf.predict(features)[0]
         # 若预测值为上涨则买入
         if prediction == 1:
-            print("支持向量预测买入{}".format(symbol))
+            logger.info("支持向量预测买入{}".format(symbol))
             order_target_percent(symbol=symbol, percent=0.33, order_type=OrderType_Market,
                                  position_side=PositionSide_Long)
 
@@ -219,10 +242,10 @@ def on_bar(context, bars):
         position = [p for p in positions if p.symbol == symbol][0]
         # 当涨幅大于10%,平掉所有仓位止盈
         if position and (now - position.created_at).days >= 1 and bar.close / position['vwap'] >= 1 + context.earn_rate:
-            print("平仓:{}涨幅{}>{}%,平掉仓位止盈".format(position.symbol, bar.close / position['vwap']-1, context.earn_rate*100))
+            logger.info("平仓:{}涨幅{}>{}%,平掉仓位止盈".format(position.symbol, bar.close / position['vwap']-1, context.earn_rate*100))
             order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
         elif position and (now - position.created_at).days >= 1 and bar.close / position['vwap'] <= 1 - context.loss_rate:
-            print("平仓:{}跌幅{}>{}%,平掉仓位止损".format(position.symbol, 1 - bar.close / position['vwap'], context.loss_rate*100))
+            logger.info("平仓:{}跌幅{}>{}%,平掉仓位止损".format(position.symbol, 1 - bar.close / position['vwap'], context.loss_rate*100))
             order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
         # 当时间为周三尾盘并且涨幅小于2%时,平掉仓位止损
         #elif position and weekday == 3 and bar.close / position['vwap'] < 1 + context.sell_rate and now.hour == 14 and now.minute == 55:
@@ -230,7 +253,7 @@ def on_bar(context, bars):
         #    order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
         # 当持股天数超过10天,平掉所有仓位止损
         elif position and (now - position.created_at).days >= context.holding_days and bar.close / position['vwap'] < 1 + context.sell_rate and now.hour == 14 and now.minute > 30:
-            print("平仓:{}持股天数超过{}并且涨幅{}<{}%，平掉所有仓位止损".format(position.symbol,context.holding_days, bar.close / position['vwap']-1, context.sell_rate*100))
+            logger.info("平仓:{}持股天数超过{}并且涨幅{}<{}%，平掉所有仓位止损".format(position.symbol,context.holding_days, bar.close / position['vwap']-1, context.sell_rate*100))
             order_target_percent(symbol=position.symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
 
 
@@ -264,7 +287,7 @@ def on_order_status(context, order):
         elif effect == 2 and side == 2:
             side_effect = '平多仓'
         order_type_word = '限价' if order_type == 1 else '市价'
-        print('{}:标的：{}，操作：以{}{}，委托价格：{}，委托数量：{}'.format(context.now, symbol, order_type_word, side_effect, price,
+        logger.info('{}:标的：{}，操作：以{}{}，委托价格：{}，委托数量：{}'.format(context.now, symbol, order_type_word, side_effect, price,
                                                          volume))
 
 
