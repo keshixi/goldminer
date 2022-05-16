@@ -286,6 +286,8 @@ def on_order_status(context, order):
             side_effect = '平空仓'
         elif effect == 2 and side == 2:
             side_effect = '平多仓'
+        else:
+            side_effect = 'Unknown'
         order_type_word = '限价' if order_type == 1 else '市价'
         logger.info('{}:标的：{}，操作：以{}{}，委托价格：{}，委托数量：{}'.format(context.now, symbol, order_type_word, side_effect, price,
                                                          volume))
